@@ -2,22 +2,17 @@ package voice
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 )
 
-// WhisperTranscriber uses faster-whisper (Python subprocess) for STT.
+// WhisperTranscriber uses a persistent faster-whisper Python worker for STT.
+// The model loads once at startup and stays resident across all transcriptions.
 type WhisperTranscriber struct {
-	Model    string // whisper model size: "tiny", "base", "small", "medium"
-	Language string // language code: "es", "en", etc.
-	Python   string // path to python3 binary
+	Model    string
+	Language string
+	w        *worker
 }
 
-// NewWhisperTranscriber creates a transcriber using faster-whisper.
-// It auto-detects the jarvis-env venv python if available.
 func NewWhisperTranscriber(model, language string) *WhisperTranscriber {
 	if model == "" {
 		model = "base"
@@ -25,40 +20,44 @@ func NewWhisperTranscriber(model, language string) *WhisperTranscriber {
 	if language == "" {
 		language = "es"
 	}
-
-	python := "python3"
-	venvPython := filepath.Join(os.Getenv("HOME"), "jarvis-env", "bin", "python3")
-	if _, err := os.Stat(venvPython); err == nil {
-		python = venvPython
-	}
-
-	return &WhisperTranscriber{Model: model, Language: language, Python: python}
+	return &WhisperTranscriber{Model: model, Language: language}
 }
 
-func (w *WhisperTranscriber) Transcribe(ctx context.Context, wavPath string) (string, error) {
-	script := fmt.Sprintf(`
-import sys, json
-from faster_whisper import WhisperModel
-model = WhisperModel("%s", device="cpu", compute_type="int8")
-segments, info = model.transcribe(sys.argv[1], language="%s", beam_size=1, vad_filter=True)
-text = " ".join(s.text.strip() for s in segments)
-print(json.dumps({"text": text.strip()}))
-`, w.Model, w.Language)
-
-	cmd := exec.CommandContext(ctx, w.Python, "-c", script, wavPath)
-	out, err := cmd.Output()
+// Start launches the persistent STT worker. Must be called before Transcribe.
+func (t *WhisperTranscriber) Start(ctx context.Context) error {
+	script, err := getScript("stt_worker.py")
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("whisper STT error: %s", string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("whisper STT exec: %w", err)
+		return err
+	}
+	w, err := startWorker(ctx, findPython(), script, t.Model, t.Language)
+	if err != nil {
+		return fmt.Errorf("STT worker start: %w", err)
+	}
+	t.w = w
+	return nil
+}
+
+func (t *WhisperTranscriber) Transcribe(ctx context.Context, wavPath string) (string, error) {
+	if t.w == nil {
+		return "", fmt.Errorf("STT worker not started")
 	}
 
-	var result struct {
-		Text string `json:"text"`
+	req := map[string]string{"wav_path": wavPath}
+	var resp struct {
+		Text  string `json:"text"`
+		Error string `json:"error"`
 	}
-	if err := json.Unmarshal(out, &result); err != nil {
-		return "", fmt.Errorf("whisper STT parse: %w", err)
+	if err := t.w.call(req, &resp); err != nil {
+		return "", fmt.Errorf("STT call: %w", err)
 	}
-	return result.Text, nil
+	if resp.Error != "" {
+		return "", fmt.Errorf("STT: %s", resp.Error)
+	}
+	return resp.Text, nil
+}
+
+func (t *WhisperTranscriber) Stop() {
+	if t.w != nil {
+		t.w.stop()
+	}
 }

@@ -21,6 +21,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
@@ -31,6 +32,8 @@ import (
 // Compile-time interface checks.
 var _ channels.Channel = (*Channel)(nil)
 var _ channels.WebhookChannel = (*Channel)(nil)
+
+var chatIDCounter atomic.Uint64
 
 // Channel implements a voice I/O channel for GoClaw.
 type Channel struct {
@@ -99,9 +102,21 @@ func (c *Channel) WithAudioSource(src AudioSource) { c.mic = src }
 // WithAudioSink replaces the speaker/audio output.
 func (c *Channel) WithAudioSink(sink AudioSink) { c.spk = sink }
 
-// Start begins the local voice loop (if enabled). HTTP mode is always available
-// via WebhookHandler regardless.
+// Start initializes workers and begins the local voice loop (if enabled).
+// HTTP mode is always available via WebhookHandler regardless.
 func (c *Channel) Start(ctx context.Context) error {
+	// Start any Startable components (persistent workers)
+	for name, component := range map[string]any{
+		"stt": c.stt, "mic": c.mic,
+	} {
+		if s, ok := component.(Startable); ok {
+			if err := s.Start(ctx); err != nil {
+				c.MarkFailed("Worker failed", err.Error(), channels.ChannelFailureKindUnknown, true)
+				return fmt.Errorf("voice: %s start: %w", name, err)
+			}
+		}
+	}
+
 	c.SetRunning(true)
 	c.MarkHealthy("Listening")
 
@@ -116,7 +131,7 @@ func (c *Channel) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down the voice channel.
+// Stop gracefully shuts down the voice channel and all workers.
 func (c *Channel) Stop(ctx context.Context) error {
 	if c.cancelLocal != nil {
 		c.cancelLocal()
@@ -126,6 +141,11 @@ func (c *Channel) Stop(ctx context.Context) error {
 	}
 	if c.spk != nil {
 		c.spk.Close()
+	}
+	// Stop STT worker if it has a Stop method
+	type stoppable interface{ Stop() }
+	if s, ok := c.stt.(stoppable); ok {
+		s.Stop()
 	}
 	c.SetRunning(false)
 	c.MarkStopped("")
@@ -144,11 +164,13 @@ func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 		return nil
 	}
 
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
 	select {
 	case ch <- msg.Content:
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(30 * time.Second):
+	case <-timer.C:
 		return fmt.Errorf("voice: timeout delivering response to chatID %s", msg.ChatID)
 	}
 	return nil
@@ -197,8 +219,10 @@ func (c *Channel) processOneUtterance(ctx context.Context) (string, error) {
 	}
 	defer os.Remove(wavPath)
 
-	// 2. Transcribe
-	text, err := c.stt.Transcribe(ctx, wavPath)
+	// 2. Transcribe (with timeout to prevent hanging on corrupt audio)
+	sttCtx, sttCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer sttCancel()
+	text, err := c.stt.Transcribe(sttCtx, wavPath)
 	if err != nil {
 		return "", fmt.Errorf("STT: %w", err)
 	}
@@ -229,7 +253,7 @@ func (c *Channel) processOneUtterance(ctx context.Context) (string, error) {
 
 // sendAndWait publishes a message to the bus and blocks until the agent responds.
 func (c *Channel) sendAndWait(ctx context.Context, senderID, text string) (string, error) {
-	chatID := fmt.Sprintf("voice-%d", time.Now().UnixNano())
+	chatID := fmt.Sprintf("voice-%d", chatIDCounter.Add(1))
 	respCh := make(chan string, 1)
 	c.pendingMu.Lock()
 	c.pending[chatID] = respCh

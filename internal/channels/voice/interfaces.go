@@ -3,36 +3,37 @@ package voice
 import "context"
 
 // Transcriber converts audio to text (STT).
-// Implementations: WhisperTranscriber (subprocess), HTTPTranscriber (proxy to any API).
+// Implementations: WhisperTranscriber (persistent worker), HTTPTranscriber (proxy).
 type Transcriber interface {
-	// Transcribe takes a path to a WAV file and returns the transcribed text.
 	Transcribe(ctx context.Context, wavPath string) (string, error)
 }
 
 // Synthesizer converts text to audio (TTS).
-// Implementations: PiperSynthesizer (subprocess), HTTPSynthesizer (proxy to any API).
+// Implementations: PiperSynthesizer (subprocess), HTTPSynthesizer (proxy).
 type Synthesizer interface {
-	// Synthesize takes text and returns WAV audio bytes.
 	Synthesize(ctx context.Context, text string) ([]byte, error)
-	// SampleRate returns the output audio sample rate in Hz.
 	SampleRate() int
 }
 
 // AudioSource provides audio input.
-// Implementations: LocalMic (ALSA capture), HTTPSource (uploaded WAV).
+// Implementations: LocalMic (Silero VAD worker), WakeWordMic (openWakeWord worker).
 type AudioSource interface {
-	// ListenOnce blocks until an utterance is captured (via VAD), then returns the WAV path.
-	// The caller is responsible for deleting the file after use.
+	// ListenOnce blocks until an utterance is captured, returns path to WAV file.
+	// Returns ("", nil) if no speech was detected (not an error).
+	// Caller must delete the file after use.
 	ListenOnce(ctx context.Context) (wavPath string, err error)
-	// Close releases audio resources.
 	Close() error
 }
 
 // AudioSink plays audio output.
-// Implementations: LocalSpeaker (ALSA playback), HTTPSink (return bytes in HTTP response).
+// Implementations: LocalSpeaker (aplay).
 type AudioSink interface {
-	// Play takes WAV audio bytes and plays them.
 	Play(ctx context.Context, wavData []byte) error
-	// Close releases audio resources.
 	Close() error
+}
+
+// Startable is optionally implemented by components that need async initialization
+// (e.g., launching a persistent worker subprocess).
+type Startable interface {
+	Start(ctx context.Context) error
 }
