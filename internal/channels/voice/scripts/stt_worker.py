@@ -7,7 +7,9 @@ Protocol (JSON lines on stdin/stdout):
   Response: → {"text": "transcribed text"} or {"error": "..."}
 """
 import json
+import signal
 import sys
+
 
 def main():
     model_size = sys.argv[1] if len(sys.argv) > 1 else "base"
@@ -25,7 +27,9 @@ def main():
         try:
             req = json.loads(line)
             wav_path = req["wav_path"]
-            segments, info = model.transcribe(wav_path, language=language, beam_size=1, vad_filter=True)
+            segments, info = model.transcribe(
+                wav_path, language=language, beam_size=1, vad_filter=True
+            )
             text = " ".join(s.text.strip() for s in segments).strip()
             print(json.dumps({"text": text}), flush=True)
         except Exception as e:
@@ -33,4 +37,6 @@ def main():
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     main()

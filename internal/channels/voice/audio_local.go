@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 )
@@ -11,20 +12,24 @@ import (
 // LocalMic captures audio using a persistent Python worker with Silero VAD.
 // Models load once at startup. Each ListenOnce() call sends a request and waits.
 type LocalMic struct {
-	w *worker
+	python string
+	w      *worker
 }
 
 func NewLocalMic() *LocalMic {
-	return &LocalMic{}
+	return &LocalMic{python: findPython()}
 }
 
-// Start launches the persistent mic worker.
 func (m *LocalMic) Start(ctx context.Context) error {
+	return m.startWorker(ctx)
+}
+
+func (m *LocalMic) startWorker(ctx context.Context) error {
 	script, err := getScript("mic_worker.py")
 	if err != nil {
 		return err
 	}
-	w, err := startWorker(ctx, findPython(), script)
+	w, err := startWorker(ctx, m.python, script)
 	if err != nil {
 		return fmt.Errorf("mic worker start: %w", err)
 	}
@@ -33,8 +38,12 @@ func (m *LocalMic) Start(ctx context.Context) error {
 }
 
 func (m *LocalMic) ListenOnce(ctx context.Context) (string, error) {
-	if m.w == nil {
-		return "", fmt.Errorf("mic worker not started")
+	// Auto-restart dead worker
+	if m.w == nil || !m.w.alive() {
+		slog.Warn("mic worker dead, restarting")
+		if err := m.startWorker(ctx); err != nil {
+			return "", fmt.Errorf("mic restart: %w", err)
+		}
 	}
 
 	tmp, err := os.CreateTemp("", "voice-mic-*.wav")
@@ -49,7 +58,7 @@ func (m *LocalMic) ListenOnce(ctx context.Context) (string, error) {
 		Path  string `json:"path"`
 		Error string `json:"error"`
 	}
-	if err := m.w.call(req, &resp); err != nil {
+	if err := m.w.call(ctx, req, &resp); err != nil {
 		os.Remove(wavPath)
 		return "", fmt.Errorf("mic call: %w", err)
 	}
@@ -69,7 +78,7 @@ func (m *LocalMic) Close() error {
 
 // LocalSpeaker plays audio through a local ALSA output device using aplay.
 type LocalSpeaker struct {
-	Device string // ALSA device (e.g. "default", "hw:1,0"). Empty = default.
+	Device string
 }
 
 func NewLocalSpeaker(device string) *LocalSpeaker {

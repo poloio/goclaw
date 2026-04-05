@@ -3,14 +3,15 @@ package voice
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 )
 
 // WakeWordMic uses a persistent Python worker running openWakeWord + Silero VAD.
-// Models load once at startup. The worker listens for the wake word, then captures
-// the utterance — all on the same audio stream (no reopen gap).
+// Models load once at startup. Same audio stream for both phases (no gap).
 type WakeWordMic struct {
 	WakeWord string
+	python   string
 	w        *worker
 }
 
@@ -18,16 +19,19 @@ func NewWakeWordMic(wakeWord string) *WakeWordMic {
 	if wakeWord == "" {
 		wakeWord = "hey_jarvis"
 	}
-	return &WakeWordMic{WakeWord: wakeWord}
+	return &WakeWordMic{WakeWord: wakeWord, python: findPython()}
 }
 
-// Start launches the persistent wake word worker.
 func (m *WakeWordMic) Start(ctx context.Context) error {
+	return m.startWorker(ctx)
+}
+
+func (m *WakeWordMic) startWorker(ctx context.Context) error {
 	script, err := getScript("wakeword_worker.py")
 	if err != nil {
 		return err
 	}
-	w, err := startWorker(ctx, findPython(), script, m.WakeWord)
+	w, err := startWorker(ctx, m.python, script, m.WakeWord)
 	if err != nil {
 		return fmt.Errorf("wake word worker start: %w", err)
 	}
@@ -36,8 +40,12 @@ func (m *WakeWordMic) Start(ctx context.Context) error {
 }
 
 func (m *WakeWordMic) ListenOnce(ctx context.Context) (string, error) {
-	if m.w == nil {
-		return "", fmt.Errorf("wake word worker not started")
+	// Auto-restart dead worker
+	if m.w == nil || !m.w.alive() {
+		slog.Warn("wake word worker dead, restarting")
+		if err := m.startWorker(ctx); err != nil {
+			return "", fmt.Errorf("wake word restart: %w", err)
+		}
 	}
 
 	tmp, err := os.CreateTemp("", "voice-ww-*.wav")
@@ -52,13 +60,13 @@ func (m *WakeWordMic) ListenOnce(ctx context.Context) (string, error) {
 		Path  string `json:"path"`
 		Error string `json:"error"`
 	}
-	if err := m.w.call(req, &resp); err != nil {
+	if err := m.w.call(ctx, req, &resp); err != nil {
 		os.Remove(wavPath)
 		return "", fmt.Errorf("wake word call: %w", err)
 	}
 	if resp.Error != "" {
 		os.Remove(wavPath)
-		return "", nil // no speech after wake word, not an error
+		return "", nil
 	}
 	return resp.Path, nil
 }

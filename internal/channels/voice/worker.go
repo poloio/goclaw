@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 )
 
 // worker manages a persistent Python subprocess that communicates via
@@ -30,9 +32,9 @@ func findPython() string {
 	return "python3"
 }
 
-// startWorker launches a persistent Python script as a subprocess.
-// scriptPath is the path to a .py file (written to a temp dir from embedded content).
-// args are extra CLI arguments passed to the script.
+// startWorker launches a persistent Python script and waits for the ready signal.
+// Tolerates noisy stdout (library warnings) before the JSON ready message.
+// Times out after 120s if the ready signal never arrives.
 func startWorker(ctx context.Context, python, scriptPath string, args ...string) (*worker, error) {
 	cmdArgs := append([]string{"-u", scriptPath}, args...) // -u for unbuffered stdout
 	cmd := exec.CommandContext(ctx, python, cmdArgs...)
@@ -57,31 +59,54 @@ func startWorker(ctx context.Context, python, scriptPath string, args ...string)
 		stdout: bufio.NewScanner(stdoutPipe),
 	}
 
-	// Wait for ready signal
-	if w.stdout.Scan() {
-		var msg map[string]string
-		if err := json.Unmarshal(w.stdout.Bytes(), &msg); err == nil {
+	// Wait for ready signal with timeout. Skip non-JSON lines (library warnings).
+	deadline := time.After(120 * time.Second)
+	readyCh := make(chan error, 1)
+	go func() {
+		for w.stdout.Scan() {
+			line := w.stdout.Text()
+			// Skip non-JSON lines (torch/onnx warnings printed to stdout)
+			if !strings.HasPrefix(strings.TrimSpace(line), "{") {
+				slog.Debug("worker: skipping non-JSON line", "line", line)
+				continue
+			}
+			var msg map[string]string
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				slog.Debug("worker: skipping unparseable line", "line", line)
+				continue
+			}
 			if msg["status"] == "ready" {
-				slog.Info("worker ready", "script", scriptPath)
-				return w, nil
+				readyCh <- nil
+				return
 			}
 			if errMsg := msg["error"]; errMsg != "" {
-				cmd.Process.Kill()
-				return nil, fmt.Errorf("worker init error: %s", errMsg)
+				readyCh <- fmt.Errorf("worker init: %s", errMsg)
+				return
 			}
 		}
-	}
-	if err := w.stdout.Err(); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("worker stdout: %w", err)
-	}
+		readyCh <- fmt.Errorf("worker stdout closed before ready (err: %v)", w.stdout.Err())
+	}()
 
-	cmd.Process.Kill()
-	return nil, fmt.Errorf("worker did not send ready signal")
+	select {
+	case err := <-readyCh:
+		if err != nil {
+			cmd.Process.Kill()
+			return nil, err
+		}
+		slog.Info("worker ready", "script", scriptPath)
+		return w, nil
+	case <-deadline:
+		cmd.Process.Kill()
+		return nil, fmt.Errorf("worker startup timeout (120s)")
+	case <-ctx.Done():
+		cmd.Process.Kill()
+		return nil, ctx.Err()
+	}
 }
 
 // call sends a JSON request and reads a JSON response. Thread-safe.
-func (w *worker) call(req any, resp any) error {
+// Respects the provided context — returns early if cancelled or timed out.
+func (w *worker) call(ctx context.Context, req any, resp any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -89,17 +114,39 @@ func (w *worker) call(req any, resp any) error {
 		return fmt.Errorf("worker send: %w", err)
 	}
 
-	if !w.stdout.Scan() {
-		if err := w.stdout.Err(); err != nil {
-			return fmt.Errorf("worker recv: %w", err)
+	// Read response with context awareness
+	readCh := make(chan error, 1)
+	go func() {
+		if !w.stdout.Scan() {
+			if err := w.stdout.Err(); err != nil {
+				readCh <- fmt.Errorf("worker recv: %w", err)
+			} else {
+				readCh <- fmt.Errorf("worker: subprocess closed stdout")
+			}
+			return
 		}
-		return fmt.Errorf("worker: subprocess closed stdout")
-	}
+		if err := json.Unmarshal(w.stdout.Bytes(), resp); err != nil {
+			readCh <- fmt.Errorf("worker parse: %w (raw: %s)", err, w.stdout.Text())
+			return
+		}
+		readCh <- nil
+	}()
 
-	if err := json.Unmarshal(w.stdout.Bytes(), resp); err != nil {
-		return fmt.Errorf("worker parse: %w (raw: %s)", err, w.stdout.Text())
+	select {
+	case err := <-readCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return nil
+}
+
+// alive checks if the subprocess is still running.
+func (w *worker) alive() bool {
+	if w == nil || w.cmd == nil || w.cmd.Process == nil {
+		return false
+	}
+	// cmd.ProcessState is set after Wait() completes. If nil, process is still running.
+	return w.cmd.ProcessState == nil
 }
 
 // stop gracefully shuts down the worker.
@@ -108,5 +155,11 @@ func (w *worker) stop() {
 		return
 	}
 	w.cmd.Process.Signal(os.Interrupt)
-	w.cmd.Wait()
+	done := make(chan struct{})
+	go func() { w.cmd.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		w.cmd.Process.Kill()
+	}
 }

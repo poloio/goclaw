@@ -3,6 +3,7 @@ package voice
 import (
 	"context"
 	"fmt"
+	"log/slog"
 )
 
 // WhisperTranscriber uses a persistent faster-whisper Python worker for STT.
@@ -10,6 +11,7 @@ import (
 type WhisperTranscriber struct {
 	Model    string
 	Language string
+	python   string
 	w        *worker
 }
 
@@ -20,16 +22,19 @@ func NewWhisperTranscriber(model, language string) *WhisperTranscriber {
 	if language == "" {
 		language = "es"
 	}
-	return &WhisperTranscriber{Model: model, Language: language}
+	return &WhisperTranscriber{Model: model, Language: language, python: findPython()}
 }
 
-// Start launches the persistent STT worker. Must be called before Transcribe.
 func (t *WhisperTranscriber) Start(ctx context.Context) error {
+	return t.startWorker(ctx)
+}
+
+func (t *WhisperTranscriber) startWorker(ctx context.Context) error {
 	script, err := getScript("stt_worker.py")
 	if err != nil {
 		return err
 	}
-	w, err := startWorker(ctx, findPython(), script, t.Model, t.Language)
+	w, err := startWorker(ctx, t.python, script, t.Model, t.Language)
 	if err != nil {
 		return fmt.Errorf("STT worker start: %w", err)
 	}
@@ -38,8 +43,12 @@ func (t *WhisperTranscriber) Start(ctx context.Context) error {
 }
 
 func (t *WhisperTranscriber) Transcribe(ctx context.Context, wavPath string) (string, error) {
-	if t.w == nil {
-		return "", fmt.Errorf("STT worker not started")
+	// Auto-restart dead worker
+	if t.w == nil || !t.w.alive() {
+		slog.Warn("STT worker dead, restarting")
+		if err := t.startWorker(ctx); err != nil {
+			return "", fmt.Errorf("STT restart: %w", err)
+		}
 	}
 
 	req := map[string]string{"wav_path": wavPath}
@@ -47,7 +56,7 @@ func (t *WhisperTranscriber) Transcribe(ctx context.Context, wavPath string) (st
 		Text  string `json:"text"`
 		Error string `json:"error"`
 	}
-	if err := t.w.call(req, &resp); err != nil {
+	if err := t.w.call(ctx, req, &resp); err != nil {
 		return "", fmt.Errorf("STT call: %w", err)
 	}
 	if resp.Error != "" {

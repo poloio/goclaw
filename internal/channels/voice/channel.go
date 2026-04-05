@@ -105,16 +105,33 @@ func (c *Channel) WithAudioSink(sink AudioSink) { c.spk = sink }
 // Start initializes workers and begins the local voice loop (if enabled).
 // HTTP mode is always available via WebhookHandler regardless.
 func (c *Channel) Start(ctx context.Context) error {
-	// Start any Startable components (persistent workers)
-	for name, component := range map[string]any{
-		"stt": c.stt, "mic": c.mic,
-	} {
-		if s, ok := component.(Startable); ok {
-			if err := s.Start(ctx); err != nil {
-				c.MarkFailed("Worker failed", err.Error(), channels.ChannelFailureKindUnknown, true)
-				return fmt.Errorf("voice: %s start: %w", name, err)
+	// Start components in order: STT first, then mic.
+	// On partial failure, stop already-started components.
+	type namedStartable struct {
+		name string
+		s    Startable
+	}
+	var toStart []namedStartable
+	if s, ok := c.stt.(Startable); ok {
+		toStart = append(toStart, namedStartable{"stt", s})
+	}
+	if s, ok := c.mic.(Startable); ok {
+		toStart = append(toStart, namedStartable{"mic", s})
+	}
+
+	var started []namedStartable
+	for _, ns := range toStart {
+		if err := ns.s.Start(ctx); err != nil {
+			// Cleanup already-started workers
+			for _, s := range started {
+				if stopper, ok := s.s.(interface{ Stop() }); ok {
+					stopper.Stop()
+				}
 			}
+			c.MarkFailed("Worker failed", err.Error(), channels.ChannelFailureKindUnknown, true)
+			return fmt.Errorf("voice: %s start: %w", ns.name, err)
 		}
+		started = append(started, ns)
 	}
 
 	c.SetRunning(true)
@@ -142,11 +159,12 @@ func (c *Channel) Stop(ctx context.Context) error {
 	if c.spk != nil {
 		c.spk.Close()
 	}
-	// Stop STT worker if it has a Stop method
+	// Stop workers
 	type stoppable interface{ Stop() }
 	if s, ok := c.stt.(stoppable); ok {
 		s.Stop()
 	}
+	CleanupScripts()
 	c.SetRunning(false)
 	c.MarkStopped("")
 	return nil

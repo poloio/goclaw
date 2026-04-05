@@ -10,6 +10,7 @@ Protocol (JSON lines on stdin/stdout):
   Response: → {"path": "/tmp/foo.wav"} or {"error": "no speech"} or {"error": "..."}
 """
 import json
+import signal
 import struct
 import sys
 import time
@@ -18,6 +19,14 @@ import wave
 import pyaudio
 import torch
 from openwakeword.model import Model as OWWModel
+
+
+SAMPLE_RATE = 16000
+VAD_THRESHOLD = 0.5
+SILENCE_TIMEOUT = 1.0
+WW_THRESHOLD = 0.5
+# 1280 samples = 80ms at 16kHz. Works for both openWakeWord and Silero VAD.
+CHUNK = 1280
 
 
 def find_input_device(pa):
@@ -29,13 +38,6 @@ def find_input_device(pa):
 
 def main():
     wake_word = sys.argv[1] if len(sys.argv) > 1 else "hey_jarvis"
-    sample_rate = 16000
-    vad_threshold = 0.5
-    silence_timeout = 1.0
-    ww_threshold = 0.5
-    # Use 1280 samples (80ms) for both phases — openWakeWord needs 80ms,
-    # Silero VAD works fine with any chunk size at 16kHz.
-    chunk = 1280
 
     oww = OWWModel(wakeword_models=[wake_word], inference_framework="onnx")
     vad, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
@@ -52,24 +54,31 @@ def main():
         line = line.strip()
         if not line:
             continue
+
+        stream = None
         try:
             req = json.loads(line)
             out_path = req["out_path"]
 
-            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=sample_rate,
-                             input=True, input_device_index=dev, frames_per_buffer=chunk)
+            # Re-check device
+            new_dev = find_input_device(pa)
+            if new_dev is not None:
+                dev = new_dev
 
-            # --- Phase 1: wait for wake word (same stream used for phase 2) ---
+            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
+                             input=True, input_device_index=dev, frames_per_buffer=CHUNK)
+
+            # --- Phase 1: wait for wake word ---
             ww_detected = False
             while True:
-                data = stream.read(chunk, exception_on_overflow=False)
+                data = stream.read(CHUNK, exception_on_overflow=False)
                 n_samples = len(data) // 2
                 samples = struct.unpack(f"<{n_samples}h", data)
                 audio_f32 = [s / 32768.0 for s in samples]
 
                 prediction = oww.predict_clip(audio_f32)
                 for name, scores in prediction.items():
-                    if max(scores) > ww_threshold:
+                    if max(scores) > WW_THRESHOLD:
                         ww_detected = True
                         break
                 if ww_detected:
@@ -82,35 +91,37 @@ def main():
             has_speech = False
 
             while True:
-                data = stream.read(chunk, exception_on_overflow=False)
+                data = stream.read(CHUNK, exception_on_overflow=False)
                 frames.append(data)
                 n_samples = len(data) // 2
                 if n_samples == 0:
                     continue
                 samples = struct.unpack(f"<{n_samples}h", data)
                 tensor = torch.FloatTensor(samples) / 32768.0
-                prob = vad(tensor, sample_rate).item()
 
-                if prob > vad_threshold:
+                with torch.no_grad():
+                    prob = vad(tensor, SAMPLE_RATE).item()
+
+                if prob > VAD_THRESHOLD:
                     has_speech = True
                     silence_start = None
                 elif has_speech:
                     if silence_start is None:
                         silence_start = time.time()
-                    elif time.time() - silence_start > silence_timeout:
+                    elif time.time() - silence_start > SILENCE_TIMEOUT:
                         break
                 else:
                     # Grace period: 5s with no speech after wake word
-                    if len(frames) * chunk / sample_rate > 5:
+                    if len(frames) * CHUNK / SAMPLE_RATE > 5:
                         break
 
-                if len(frames) * chunk / sample_rate > 30:
+                if len(frames) * CHUNK / SAMPLE_RATE > 30:
                     break
 
-            stream.stop_stream()
-            stream.close()
             vad.reset_states()
-            oww.reset()
+            # Reset openWakeWord internal buffers for next detection cycle
+            if hasattr(oww, 'preprocessor') and hasattr(oww.preprocessor, 'reset'):
+                oww.preprocessor.reset()
 
             if not has_speech:
                 print(json.dumps({"error": "no speech after wake word"}), flush=True)
@@ -119,14 +130,25 @@ def main():
             with wave.open(out_path, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
+                wf.setframerate(SAMPLE_RATE)
                 wf.writeframes(b"".join(frames))
 
             print(json.dumps({"path": out_path}), flush=True)
 
         except Exception as e:
             print(json.dumps({"error": str(e)}), flush=True)
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+
+    pa.terminate()
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     main()
