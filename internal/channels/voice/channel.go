@@ -1,10 +1,13 @@
-// Package voice provides a voice channel for GoClaw.
-// It exposes an HTTP API that accepts audio (WAV), runs STT,
-// routes text through the agent bus, runs TTS on the response,
-// and returns audio back to the caller.
+// Package voice provides a voice I/O channel for GoClaw.
 //
-// This enables a remote client (e.g., a PC with a gaming headset
-// or in-car mic) to interact with GoClaw agents via voice.
+// Two modes of operation:
+//   - Local: mic/speaker connected to the device (Jetson). Runs a continuous
+//     listen loop: AudioSource → Transcriber → agent bus → Synthesizer → AudioSink.
+//   - HTTP: remote client sends audio over HTTP, gets audio back. Endpoints
+//     mounted on the gateway mux via WebhookChannel.
+//
+// All STT/TTS is behind interfaces (Transcriber, Synthesizer, AudioSource, AudioSink)
+// so backends can be swapped without touching the channel logic.
 package voice
 
 import (
@@ -16,8 +19,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +27,6 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 )
-
-const TypeVoice = "voice"
 
 // Compile-time interface checks.
 var _ channels.Channel = (*Channel)(nil)
@@ -38,91 +37,98 @@ type Channel struct {
 	*channels.BaseChannel
 	cfg config.VoiceConfig
 
-	// STT state
-	sttCmd   string // path to STT binary or "whisper-ctranslate2"
-	sttModel string
+	// Pluggable components
+	stt  Transcriber
+	tts  Synthesizer
+	mic  AudioSource  // nil if local mode is disabled
+	spk  AudioSink    // nil if local mode is disabled
 
-	// TTS state
-	ttsVoicePath  string
-	ttsConfigPath string
-	ttsSampleRate string
-
-	// Pending responses: chatID -> response channel
+	// Pending responses: chatID -> response channel (for HTTP and local modes)
 	pending   map[string]chan string
 	pendingMu sync.Mutex
+
+	// Local loop control
+	cancelLocal context.CancelFunc
 }
 
-// New creates a new voice channel.
+// New creates a new voice channel with the configured STT/TTS backends.
 func New(cfg config.VoiceConfig, msgBus *bus.MessageBus) (*Channel, error) {
 	base := channels.NewBaseChannel("voice", msgBus, cfg.AllowFrom)
 
 	ch := &Channel{
 		BaseChannel: base,
 		cfg:         cfg,
-		sttModel:    cfg.STTModel,
 		pending:     make(map[string]chan string),
 	}
 
-	// Find TTS voice
-	if err := ch.findVoice(); err != nil {
-		slog.Warn("voice channel: no TTS voice found", "error", err)
+	// Initialize STT
+	ch.stt = NewWhisperTranscriber(cfg.STTModel, cfg.Language)
+
+	// Initialize TTS
+	tts, err := NewPiperSynthesizer(cfg.TTSVoice, nil)
+	if err != nil {
+		slog.Warn("voice: no TTS voice, audio output disabled", "error", err)
+	} else {
+		ch.tts = tts
+	}
+
+	// Initialize local audio if enabled (default: true)
+	if !cfg.DisableLocal {
+		ch.mic = NewLocalMic()
+		ch.spk = NewLocalSpeaker(cfg.ALSADevice)
+		slog.Info("voice: local audio enabled")
 	}
 
 	return ch, nil
 }
 
-// findVoice locates the Piper TTS voice on disk.
-func (c *Channel) findVoice() error {
-	voicesDir := filepath.Join(os.Getenv("HOME"), ".local", "share", "piper", "voices")
-	candidates := []string{"es_ES-davefx-medium", "es_MX-claude-high"}
-	if c.cfg.TTSVoice != "" {
-		candidates = append([]string{c.cfg.TTSVoice}, candidates...)
-	}
+// WithTranscriber replaces the STT backend.
+func (c *Channel) WithTranscriber(t Transcriber) { c.stt = t }
 
-	for _, name := range candidates {
-		onnx := filepath.Join(voicesDir, name+".onnx")
-		cfg := filepath.Join(voicesDir, name+".onnx.json")
-		if _, err := os.Stat(onnx); err == nil {
-			if _, err := os.Stat(cfg); err == nil {
-				c.ttsVoicePath = onnx
-				c.ttsConfigPath = cfg
-				c.ttsSampleRate = "22050"
-				// Try to read sample rate from config
-				if data, err := os.ReadFile(cfg); err == nil {
-					var parsed struct {
-						Audio struct {
-							SampleRate int `json:"sample_rate"`
-						} `json:"audio"`
-					}
-					if json.Unmarshal(data, &parsed) == nil && parsed.Audio.SampleRate > 0 {
-						c.ttsSampleRate = fmt.Sprintf("%d", parsed.Audio.SampleRate)
-					}
-				}
-				slog.Info("voice channel: TTS voice found", "voice", name, "sample_rate", c.ttsSampleRate)
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("no piper voice found in %s", voicesDir)
-}
+// WithSynthesizer replaces the TTS backend.
+func (c *Channel) WithSynthesizer(s Synthesizer) { c.tts = s }
 
-// Start is a no-op — the voice channel uses WebhookHandler to mount on the gateway mux.
+// WithAudioSource replaces the mic/audio input.
+func (c *Channel) WithAudioSource(src AudioSource) { c.mic = src }
+
+// WithAudioSink replaces the speaker/audio output.
+func (c *Channel) WithAudioSink(sink AudioSink) { c.spk = sink }
+
+// Start begins the local voice loop (if enabled). HTTP mode is always available
+// via WebhookHandler regardless.
 func (c *Channel) Start(ctx context.Context) error {
 	c.SetRunning(true)
 	c.MarkHealthy("Listening")
-	slog.Info("voice channel started", "port", "shared with gateway")
+
+	if c.mic != nil {
+		loopCtx, cancel := context.WithCancel(ctx)
+		c.cancelLocal = cancel
+		go c.localLoop(loopCtx)
+		slog.Info("voice: local listen loop started")
+	}
+
+	slog.Info("voice channel started")
 	return nil
 }
 
 // Stop gracefully shuts down the voice channel.
 func (c *Channel) Stop(ctx context.Context) error {
+	if c.cancelLocal != nil {
+		c.cancelLocal()
+	}
+	if c.mic != nil {
+		c.mic.Close()
+	}
+	if c.spk != nil {
+		c.spk.Close()
+	}
 	c.SetRunning(false)
 	c.MarkStopped("")
 	return nil
 }
 
 // Send receives an outbound message from the agent and delivers it to the
-// waiting HTTP request via the pending response channel.
+// waiting response channel (used by both local loop and HTTP handlers).
 func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	c.pendingMu.Lock()
 	ch, ok := c.pending[msg.ChatID]
@@ -143,15 +149,107 @@ func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	return nil
 }
 
-// IsAllowed checks the allowlist. For voice, we default to open (single-user car).
+// IsAllowed defaults to open for single-user deployments.
 func (c *Channel) IsAllowed(senderID string) bool {
 	if len(c.cfg.AllowFrom) == 0 {
-		return true // open by default for single-user deployments
+		return true
 	}
 	return c.BaseChannel.IsAllowed(senderID)
 }
 
-// WebhookHandler returns the HTTP handler mounted on the gateway mux.
+// --- Local voice loop ---
+
+// localLoop continuously listens for speech, transcribes, sends to agent, synthesizes, and plays.
+func (c *Channel) localLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		reply, err := c.processOneUtterance(ctx)
+		if err != nil {
+			slog.Error("voice: local loop error", "error", err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if reply == "" {
+			continue // no speech detected, loop again
+		}
+	}
+}
+
+// processOneUtterance handles one full listen→STT→agent→TTS→play cycle.
+func (c *Channel) processOneUtterance(ctx context.Context) (string, error) {
+	// 1. Listen for speech
+	wavPath, err := c.mic.ListenOnce(ctx)
+	if err != nil {
+		return "", fmt.Errorf("mic: %w", err)
+	}
+	if wavPath == "" {
+		return "", nil // no speech
+	}
+	defer os.Remove(wavPath)
+
+	// 2. Transcribe
+	text, err := c.stt.Transcribe(ctx, wavPath)
+	if err != nil {
+		return "", fmt.Errorf("STT: %w", err)
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", nil
+	}
+	slog.Info("voice: heard", "text", text)
+
+	// 3. Send to agent and wait for response
+	reply, err := c.sendAndWait(ctx, "driver", text)
+	if err != nil {
+		return "", fmt.Errorf("agent: %w", err)
+	}
+	slog.Info("voice: reply", "text", reply)
+
+	// 4. Synthesize and play
+	if c.tts != nil && c.spk != nil {
+		wavData, err := c.tts.Synthesize(ctx, reply)
+		if err != nil {
+			slog.Error("voice: TTS failed", "error", err)
+		} else if err := c.spk.Play(ctx, wavData); err != nil {
+			slog.Error("voice: playback failed", "error", err)
+		}
+	}
+
+	return reply, nil
+}
+
+// sendAndWait publishes a message to the bus and blocks until the agent responds.
+func (c *Channel) sendAndWait(ctx context.Context, senderID, text string) (string, error) {
+	chatID := fmt.Sprintf("voice-%d", time.Now().UnixNano())
+	respCh := make(chan string, 1)
+	c.pendingMu.Lock()
+	c.pending[chatID] = respCh
+	c.pendingMu.Unlock()
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, chatID)
+		c.pendingMu.Unlock()
+	}()
+
+	c.BaseChannel.HandleMessage(senderID, chatID, text, nil, nil, "direct")
+
+	select {
+	case reply := <-respCh:
+		return reply, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-time.After(30 * time.Second):
+		return "", fmt.Errorf("agent response timeout")
+	}
+}
+
+// --- HTTP mode (WebhookChannel) ---
+
+// WebhookHandler returns HTTP endpoints for remote clients.
 func (c *Channel) WebhookHandler() (string, http.Handler) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/voice/health", c.handleHealth)
@@ -161,26 +259,23 @@ func (c *Channel) WebhookHandler() (string, http.Handler) {
 	return "/voice/", mux
 }
 
-// --- HTTP Handlers ---
-
 func (c *Channel) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":    "ok",
-		"tts_voice": c.ttsVoicePath,
-		"stt_model": c.sttModel,
-	})
+	info := map[string]any{
+		"status":     "ok",
+		"local_mode": c.mic != nil,
+		"has_tts":    c.tts != nil,
+	}
+	json.NewEncoder(w).Encode(info)
 }
 
-// handlePipeline: POST audio WAV -> STT -> agent -> TTS -> return WAV
+// handlePipeline: POST WAV → STT → agent → TTS → return WAV
 func (c *Channel) handlePipeline(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Read uploaded audio
-	if err := r.ParseMultipartForm(10 << 20); err != nil { // 10MB max
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -191,20 +286,18 @@ func (c *Channel) handlePipeline(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Save to temp file for STT
-	tmpWav, err := os.CreateTemp("", "voice-*.wav")
+	tmp, err := os.CreateTemp("", "voice-http-*.wav")
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	defer os.Remove(tmpWav.Name())
-	io.Copy(tmpWav, file)
-	tmpWav.Close()
+	defer os.Remove(tmp.Name())
+	io.Copy(tmp, file)
+	tmp.Close()
 
-	// STT
-	text, err := c.transcribe(tmpWav.Name())
+	ctx := r.Context()
+	text, err := c.stt.Transcribe(ctx, tmp.Name())
 	if err != nil {
-		slog.Error("voice: STT failed", "error", err)
 		http.Error(w, "STT failed", http.StatusInternalServerError)
 		return
 	}
@@ -214,62 +307,41 @@ func (c *Channel) handlePipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create a unique chat ID for this request and register a response channel
-	chatID := fmt.Sprintf("voice-%d", time.Now().UnixNano())
-	respCh := make(chan string, 1)
-	c.pendingMu.Lock()
-	c.pending[chatID] = respCh
-	c.pendingMu.Unlock()
-	defer func() {
-		c.pendingMu.Lock()
-		delete(c.pending, chatID)
-		c.pendingMu.Unlock()
-	}()
-
-	// Publish to bus — this triggers the agent loop
 	senderID := r.Header.Get("X-Voice-Sender")
 	if senderID == "" {
 		senderID = "driver"
 	}
-	c.BaseChannel.HandleMessage(senderID, chatID, text, nil, nil, "direct")
-
-	// Wait for agent response
-	var reply string
-	select {
-	case reply = <-respCh:
-	case <-time.After(30 * time.Second):
+	reply, err := c.sendAndWait(ctx, senderID, text)
+	if err != nil {
 		http.Error(w, "agent timeout", http.StatusGatewayTimeout)
 		return
 	}
 
-	// TTS
-	wavBytes, err := c.synthesize(reply)
-	if err != nil {
-		slog.Error("voice: TTS failed", "error", err)
-		// Return text even if TTS fails
+	if c.tts == nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"text":  text,
-			"reply": reply,
-			"error": "TTS failed",
-		})
+		json.NewEncoder(w).Encode(map[string]string{"text": text, "reply": reply})
 		return
 	}
 
-	// Return audio with text in headers
+	wavBytes, err := c.tts.Synthesize(ctx, reply)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"text": text, "reply": reply, "error": "TTS failed"})
+		return
+	}
+
 	w.Header().Set("Content-Type", "audio/wav")
 	w.Header().Set("X-User-Text", url.QueryEscape(text))
 	w.Header().Set("X-Reply-Text", url.QueryEscape(reply))
 	w.Write(wavBytes)
 }
 
-// handleChat: POST JSON {"message": "..."} -> agent -> JSON {"reply": "..."}
+// handleChat: POST JSON {"message":"..."} → agent → JSON {"reply":"..."}
 func (c *Channel) handleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-
 	var req struct {
 		Message string `json:"message"`
 	}
@@ -278,24 +350,8 @@ func (c *Channel) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatID := fmt.Sprintf("voice-%d", time.Now().UnixNano())
-	respCh := make(chan string, 1)
-	c.pendingMu.Lock()
-	c.pending[chatID] = respCh
-	c.pendingMu.Unlock()
-	defer func() {
-		c.pendingMu.Lock()
-		delete(c.pending, chatID)
-		c.pendingMu.Unlock()
-	}()
-
-	senderID := "driver"
-	c.BaseChannel.HandleMessage(senderID, chatID, req.Message, nil, nil, "direct")
-
-	var reply string
-	select {
-	case reply = <-respCh:
-	case <-time.After(30 * time.Second):
+	reply, err := c.sendAndWait(r.Context(), "driver", req.Message)
+	if err != nil {
 		http.Error(w, "agent timeout", http.StatusGatewayTimeout)
 		return
 	}
@@ -304,13 +360,12 @@ func (c *Channel) handleChat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"reply": reply})
 }
 
-// handleSpeak: POST JSON {"text": "..."} -> TTS -> return WAV
+// handleSpeak: POST JSON {"text":"..."} → TTS → WAV
 func (c *Channel) handleSpeak(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-
 	var req struct {
 		Text string `json:"text"`
 	}
@@ -318,8 +373,12 @@ func (c *Channel) handleSpeak(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	if c.tts == nil {
+		http.Error(w, "no TTS configured", http.StatusServiceUnavailable)
+		return
+	}
 
-	wavBytes, err := c.synthesize(req.Text)
+	wavBytes, err := c.tts.Synthesize(r.Context(), req.Text)
 	if err != nil {
 		http.Error(w, "TTS failed", http.StatusInternalServerError)
 		return
@@ -327,72 +386,4 @@ func (c *Channel) handleSpeak(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "audio/wav")
 	w.Write(wavBytes)
-}
-
-// --- STT ---
-
-// transcribe runs faster-whisper on a WAV file and returns the text.
-func (c *Channel) transcribe(wavPath string) (string, error) {
-	// Use a small Python wrapper since faster-whisper is Python-only
-	script := fmt.Sprintf(`
-import sys, json
-from faster_whisper import WhisperModel
-model = WhisperModel("%s", device="cpu", compute_type="int8")
-segments, info = model.transcribe(sys.argv[1], language="es", beam_size=1, vad_filter=True)
-text = " ".join(s.text.strip() for s in segments)
-print(json.dumps({"text": text.strip()}))
-`, c.sttModel)
-
-	cmd := exec.Command("python3", "-c", script, wavPath)
-	// Use the jarvis venv if available
-	venvPython := filepath.Join(os.Getenv("HOME"), "jarvis-env", "bin", "python3")
-	if _, err := os.Stat(venvPython); err == nil {
-		cmd = exec.Command(venvPython, "-c", script, wavPath)
-	}
-
-	out, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("STT error: %s", string(exitErr.Stderr))
-		}
-		return "", err
-	}
-
-	var result struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(out, &result); err != nil {
-		return "", fmt.Errorf("STT parse error: %w", err)
-	}
-	return result.Text, nil
-}
-
-// --- TTS ---
-
-// synthesize runs Piper TTS on text and returns WAV bytes.
-func (c *Channel) synthesize(text string) ([]byte, error) {
-	if c.ttsVoicePath == "" {
-		return nil, fmt.Errorf("no TTS voice configured")
-	}
-
-	tmpWav, err := os.CreateTemp("", "voice-tts-*.wav")
-	if err != nil {
-		return nil, err
-	}
-	tmpPath := tmpWav.Name()
-	tmpWav.Close()
-	defer os.Remove(tmpPath)
-
-	cmd := exec.Command("piper",
-		"--model", c.ttsVoicePath,
-		"--config", c.ttsConfigPath,
-		"--output_file", tmpPath,
-	)
-	cmd.Stdin = strings.NewReader(text)
-
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("piper error: %s: %w", string(out), err)
-	}
-
-	return os.ReadFile(tmpPath)
 }

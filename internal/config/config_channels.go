@@ -24,14 +24,16 @@ type ChannelsConfig struct {
 	PendingCompaction *PendingCompactionConfig `json:"pending_compaction,omitempty"` // global pending message compaction settings
 }
 
-// VoiceConfig configures the voice channel (STT + TTS over HTTP).
+// VoiceConfig configures the voice channel (STT + TTS, local or remote).
 // Designed for edge deployment on Jetson with local mic/speaker or remote client.
 type VoiceConfig struct {
-	Enabled   bool                `json:"enabled"`
-	AllowFrom FlexibleStringSlice `json:"allow_from"`
-	STTModel  string              `json:"stt_model,omitempty"`  // faster-whisper model size (default "base")
-	TTSVoice  string              `json:"tts_voice,omitempty"`  // piper voice name (default "es_ES-davefx-medium")
-	Language  string              `json:"language,omitempty"`   // STT language code (default "es")
+	Enabled      bool                `json:"enabled"`
+	AllowFrom    FlexibleStringSlice `json:"allow_from"`
+	STTModel     string              `json:"stt_model,omitempty"`     // faster-whisper model size: "tiny", "base", "small" (default "base")
+	TTSVoice     string              `json:"tts_voice,omitempty"`     // piper voice name (default "es_ES-davefx-medium")
+	Language     string              `json:"language,omitempty"`      // STT language code (default "es")
+	DisableLocal bool                `json:"disable_local,omitempty"` // disable local mic/speaker loop (HTTP-only mode)
+	ALSADevice   string              `json:"alsa_device,omitempty"`   // ALSA output device (default "default")
 }
 
 type TelegramConfig struct {
