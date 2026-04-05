@@ -32,6 +32,7 @@ type VoiceConfig struct {
 	STTModel     string              `json:"stt_model,omitempty"`     // faster-whisper model size: "tiny", "base", "small" (default "base")
 	TTSVoice     string              `json:"tts_voice,omitempty"`     // piper voice name (default "es_ES-davefx-medium")
 	Language     string              `json:"language,omitempty"`      // STT language code (default "es")
+	WakeWord     string              `json:"wake_word,omitempty"`     // openWakeWord model: "hey_jarvis", "alexa", or path to .onnx (empty = always listen)
 	DisableLocal bool                `json:"disable_local,omitempty"` // disable local mic/speaker loop (HTTP-only mode)
 	ALSADevice   string              `json:"alsa_device,omitempty"`   // ALSA output device (default "default")
 }

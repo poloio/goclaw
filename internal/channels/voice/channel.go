@@ -74,9 +74,14 @@ func New(cfg config.VoiceConfig, msgBus *bus.MessageBus) (*Channel, error) {
 
 	// Initialize local audio if enabled (default: true)
 	if !cfg.DisableLocal {
-		ch.mic = NewLocalMic()
+		if cfg.WakeWord != "" {
+			ch.mic = NewWakeWordMic(cfg.WakeWord)
+			slog.Info("voice: local audio with wake word", "wake_word", cfg.WakeWord)
+		} else {
+			ch.mic = NewLocalMic()
+			slog.Info("voice: local audio, always listening (no wake word)")
+		}
 		ch.spk = NewLocalSpeaker(cfg.ALSADevice)
-		slog.Info("voice: local audio enabled")
 	}
 
 	return ch, nil
