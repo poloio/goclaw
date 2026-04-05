@@ -106,36 +106,53 @@ func startWorker(ctx context.Context, python, scriptPath string, args ...string)
 
 // call sends a JSON request and reads a JSON response. Thread-safe.
 // Respects the provided context — returns early if cancelled or timed out.
+// On context cancellation, the read completes in the background (no goroutine leak)
+// because the next call waits for the mutex, which the background read holds until done.
 func (w *worker) call(ctx context.Context, req any, resp any) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	if err := w.stdin.Encode(req); err != nil {
+		w.mu.Unlock()
 		return fmt.Errorf("worker send: %w", err)
 	}
 
-	// Read response with context awareness
-	readCh := make(chan error, 1)
+	// Read response in a goroutine so we can respect ctx.
+	// The goroutine holds the mutex until the read completes,
+	// preventing concurrent scanner access from a subsequent call().
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	readCh := make(chan readResult, 1)
 	go func() {
+		defer w.mu.Unlock() // release mutex when read completes (or subprocess dies)
 		if !w.stdout.Scan() {
 			if err := w.stdout.Err(); err != nil {
-				readCh <- fmt.Errorf("worker recv: %w", err)
+				readCh <- readResult{nil, fmt.Errorf("worker recv: %w", err)}
 			} else {
-				readCh <- fmt.Errorf("worker: subprocess closed stdout")
+				readCh <- readResult{nil, fmt.Errorf("worker: subprocess closed stdout")}
 			}
 			return
 		}
-		if err := json.Unmarshal(w.stdout.Bytes(), resp); err != nil {
-			readCh <- fmt.Errorf("worker parse: %w (raw: %s)", err, w.stdout.Text())
-			return
-		}
-		readCh <- nil
+		// Copy bytes — scanner buffer is reused on next Scan()
+		data := make([]byte, len(w.stdout.Bytes()))
+		copy(data, w.stdout.Bytes())
+		readCh <- readResult{data, nil}
 	}()
 
 	select {
-	case err := <-readCh:
-		return err
+	case res := <-readCh:
+		if res.err != nil {
+			return res.err
+		}
+		if err := json.Unmarshal(res.data, resp); err != nil {
+			return fmt.Errorf("worker parse: %w (raw: %s)", err, string(res.data))
+		}
+		return nil
 	case <-ctx.Done():
+		// The goroutine still holds the mutex and will complete the read.
+		// The next call() will block on mu.Lock() until the read finishes,
+		// consuming the stale response — no scanner race, no goroutine leak.
 		return ctx.Err()
 	}
 }

@@ -16,6 +16,7 @@ import sys
 import time
 import wave
 
+import numpy as np
 import pyaudio
 import torch
 from openwakeword.model import Model as OWWModel
@@ -74,11 +75,11 @@ def main():
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 n_samples = len(data) // 2
                 samples = struct.unpack(f"<{n_samples}h", data)
-                audio_f32 = [s / 32768.0 for s in samples]
+                audio_i16 = np.array(samples, dtype=np.int16)
 
-                prediction = oww.predict_clip(audio_f32)
-                for name, scores in prediction.items():
-                    if max(scores) > WW_THRESHOLD:
+                prediction = oww.predict(audio_i16)
+                for name, score in prediction.items():
+                    if score > WW_THRESHOLD:
                         ww_detected = True
                         break
                 if ww_detected:
@@ -119,9 +120,9 @@ def main():
                     break
 
             vad.reset_states()
-            # Reset openWakeWord internal buffers for next detection cycle
-            if hasattr(oww, 'preprocessor') and hasattr(oww.preprocessor, 'reset'):
-                oww.preprocessor.reset()
+            # Reset openWakeWord prediction buffers for next detection cycle
+            for mdl_name in oww.prediction_buffer:
+                oww.prediction_buffer[mdl_name] = []
 
             if not has_speech:
                 print(json.dumps({"error": "no speech after wake word"}), flush=True)

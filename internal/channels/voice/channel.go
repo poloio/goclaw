@@ -284,12 +284,14 @@ func (c *Channel) sendAndWait(ctx context.Context, senderID, text string) (strin
 
 	c.BaseChannel.HandleMessage(senderID, chatID, text, nil, nil, "direct")
 
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
 	select {
 	case reply := <-respCh:
 		return reply, nil
 	case <-ctx.Done():
 		return "", ctx.Err()
-	case <-time.After(30 * time.Second):
+	case <-timer.C:
 		return "", fmt.Errorf("agent response timeout")
 	}
 }
@@ -339,7 +341,11 @@ func (c *Channel) handlePipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.Remove(tmp.Name())
-	io.Copy(tmp, file)
+	if _, err := io.Copy(tmp, file); err != nil {
+		tmp.Close()
+		http.Error(w, "upload failed", http.StatusInternalServerError)
+		return
+	}
 	tmp.Close()
 
 	ctx := r.Context()

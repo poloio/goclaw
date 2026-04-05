@@ -13,6 +13,7 @@ var embeddedScripts embed.FS
 
 var (
 	scriptDirOnce sync.Once
+	scriptDirMu   sync.Mutex
 	scriptDirPath string
 	scriptDirErr  error
 )
@@ -47,8 +48,12 @@ func getScriptDir() (string, error) {
 			}
 		}
 
+		scriptDirMu.Lock()
 		scriptDirPath = dir
+		scriptDirMu.Unlock()
 	})
+	scriptDirMu.Lock()
+	defer scriptDirMu.Unlock()
 	return scriptDirPath, scriptDirErr
 }
 
@@ -62,7 +67,10 @@ func getScript(name string) (string, error) {
 
 // CleanupScripts removes the temporary script directory. Call on process shutdown.
 func CleanupScripts() {
+	scriptDirMu.Lock()
+	defer scriptDirMu.Unlock()
 	if scriptDirPath != "" {
 		os.RemoveAll(scriptDirPath)
+		scriptDirPath = ""
 	}
 }
