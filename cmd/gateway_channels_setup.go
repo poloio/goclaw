@@ -15,6 +15,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels/feishu"
 	slackchannel "github.com/nextlevelbuilder/goclaw/internal/channels/slack"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/telegram"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/voice"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/whatsapp"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/zalo"
 	zalopersonal "github.com/nextlevelbuilder/goclaw/internal/channels/zalo/personal"
@@ -117,6 +118,17 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 				channelMgr.RegisterChannel(channels.TypeSlack, sl)
 				slog.Info("slack channel enabled (config)")
 			}
+		}
+	}
+
+	if cfg.Channels.Voice.Enabled {
+		v, err := voice.New(cfg.Channels.Voice, msgBus)
+		if err != nil {
+			channelMgr.RecordFailure(channels.TypeVoice, "", err)
+			slog.Error("failed to initialize voice channel", "error", err)
+		} else {
+			channelMgr.RegisterChannel(channels.TypeVoice, v)
+			slog.Info("voice channel enabled (config)")
 		}
 	}
 

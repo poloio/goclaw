@@ -20,7 +20,18 @@ type ChannelsConfig struct {
 	Zalo              ZaloConfig               `json:"zalo"`
 	ZaloPersonal      ZaloPersonalConfig       `json:"zalo_personal"`
 	Feishu            FeishuConfig             `json:"feishu"`
+	Voice             VoiceConfig              `json:"voice"`
 	PendingCompaction *PendingCompactionConfig `json:"pending_compaction,omitempty"` // global pending message compaction settings
+}
+
+// VoiceConfig configures the voice channel (STT + TTS over HTTP).
+// Designed for edge deployment on Jetson with local mic/speaker or remote client.
+type VoiceConfig struct {
+	Enabled   bool                `json:"enabled"`
+	AllowFrom FlexibleStringSlice `json:"allow_from"`
+	STTModel  string              `json:"stt_model,omitempty"`  // faster-whisper model size (default "base")
+	TTSVoice  string              `json:"tts_voice,omitempty"`  // piper voice name (default "es_ES-davefx-medium")
+	Language  string              `json:"language,omitempty"`   // STT language code (default "es")
 }
 
 type TelegramConfig struct {
