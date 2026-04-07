@@ -1,0 +1,72 @@
+{
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 3000,
+    "max_message_chars": 4000,
+    "rate_limit_rpm": 0,
+    "block_reply": false
+  },
+  "providers": {
+    "openai": {
+      "api_key": "sk-local",
+      "api_base": "http://127.0.0.1:8081/v1"
+    }
+  },
+  "tools": {
+    "profile": "minimal",
+    "exec_approval": {
+      "security": "full",
+      "ask": "off"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "~/goclaw/workspace/jarvis",
+      "agent_type": "predefined",
+      "provider": "openai",
+      "model": "Qwen3.5-2B-Q4_K_M.gguf",
+      "max_tokens": 150,
+      "temperature": 0.35,
+      "context_window": 8192,
+      "max_tool_iterations": 5,
+      "max_tool_calls": 15,
+      "restrict_to_workspace": false,
+      "subagents": {
+        "max_concurrent": 0,
+        "max_spawn_depth": 0,
+        "max_children_per_agent": 0
+      }
+    },
+    "list": {
+      "jarvis": {
+        "display_name": "Jarvis",
+        "provider": "openai",
+        "model": "Qwen3.5-2B-Q4_K_M.gguf",
+        "max_tokens": 150,
+        "temperature": 0.35,
+        "context_window": 8192,
+        "prompt_mode": "compact",
+        "default": true,
+        "workspace": "~/goclaw/workspace/jarvis",
+        "tools": {
+          "profile": "minimal",
+          "allow": ["session_status", "memory_search", "memory_get"]
+        },
+        "identity": {
+          "name": "Jarvis",
+          "emoji": "\ud83d\ude97"
+        }
+      }
+    }
+  },
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "stt_model": "base",
+      "tts_voice": "es_ES-davefx-medium",
+      "language": "es",
+      "wake_word": "",
+      "disable_local": true
+    }
+  }
+}

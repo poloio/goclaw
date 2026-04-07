@@ -401,6 +401,7 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			BuiltinToolSettings:    builtinSettings,
 			DisabledTools:          disabledTools,
 			ReasoningConfig:        store.ResolveEffectiveReasoningConfig(providerReasoningDefaults, ag.ParseReasoningConfig()),
+			PromptMode:             PromptMode(ag.ParsePromptMode()),
 			SelfEvolve:             ag.ParseSelfEvolve(),
 			SkillEvolve:            ag.AgentType == store.AgentTypePredefined && ag.ParseSkillEvolve(),
 			SkillNudgeInterval:     ag.ParseSkillNudgeInterval(),

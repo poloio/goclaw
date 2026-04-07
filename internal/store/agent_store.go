@@ -253,6 +253,27 @@ func (a *AgentData) ParseSelfEvolve() bool {
 	return cfg.SelfEvolve
 }
 
+// ParsePromptMode extracts prompt_mode from other_config JSONB.
+// Returns "" (empty) when not set — caller should fall back to session-based detection.
+// Valid values: "full", "compact", "minimal". Invalid values are logged and ignored.
+func (a *AgentData) ParsePromptMode() string {
+	if len(a.OtherConfig) == 0 {
+		return ""
+	}
+	var cfg struct {
+		PromptMode string `json:"prompt_mode"`
+	}
+	if json.Unmarshal(a.OtherConfig, &cfg) != nil {
+		return ""
+	}
+	switch cfg.PromptMode {
+	case "full", "compact", "minimal", "":
+		return cfg.PromptMode
+	default:
+		return ""
+	}
+}
+
 // ParseSkillEvolve extracts skill_evolve from other_config JSONB.
 // When true, the agent's learning loop is enabled: system prompt includes skill
 // creation guidance, and the loop injects nudges at tool count milestones.

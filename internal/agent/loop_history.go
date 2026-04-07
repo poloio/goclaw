@@ -114,6 +114,11 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 	if bootstrap.IsSubagentSession(sessionKey) || bootstrap.IsCronSession(sessionKey) || bootstrap.IsHeartbeatSession(sessionKey) {
 		mode = PromptMinimal
 	}
+	// Per-agent prompt mode override (from other_config.prompt_mode) — allows
+	// edge/small models to use compact mode regardless of session type.
+	if l.promptMode != "" {
+		mode = l.promptMode
+	}
 
 	_, hasSpawn := l.tools.Get("spawn")
 	_, hasTeamTools := l.tools.Get("team_tasks")

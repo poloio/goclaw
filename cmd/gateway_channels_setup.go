@@ -121,17 +121,6 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 		}
 	}
 
-	if cfg.Channels.Voice.Enabled {
-		v, err := voice.New(cfg.Channels.Voice, msgBus)
-		if err != nil {
-			channelMgr.RecordFailure(channels.TypeVoice, "", err)
-			slog.Error("failed to initialize voice channel", "error", err)
-		} else {
-			channelMgr.RegisterChannel(channels.TypeVoice, v)
-			slog.Info("voice channel enabled (config)")
-		}
-	}
-
 	if cfg.Channels.Feishu.Enabled {
 		if cfg.Channels.Feishu.AppID == "" {
 			recordMissingConfig(channels.TypeFeishu, "Set channels.feishu.app_id in config.")
@@ -143,6 +132,22 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 			slog.Info("feishu/lark channel enabled (config)")
 		}
 	}
+}
+
+// registerVoiceChannel registers the voice channel independently of DB instance loader.
+// Voice is always config-driven (not a DB-backed channel instance).
+func registerVoiceChannel(cfg *config.Config, channelMgr *channels.Manager, msgBus *bus.MessageBus) {
+	if !cfg.Channels.Voice.Enabled {
+		return
+	}
+	v, err := voice.New(cfg.Channels.Voice, msgBus)
+	if err != nil {
+		channelMgr.RecordFailure(channels.TypeVoice, "", err)
+		slog.Error("failed to initialize voice channel", "error", err)
+		return
+	}
+	channelMgr.RegisterChannel(channels.TypeVoice, v)
+	slog.Info("voice channel enabled")
 }
 
 // wireChannelRPCMethods registers WS RPC methods for channels, instances, agent links, and teams.

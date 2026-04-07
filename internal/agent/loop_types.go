@@ -151,6 +151,9 @@ type Loop struct {
 	// Requested reasoning config parsed from agent other_config.
 	reasoningConfig store.AgentReasoningConfig
 
+	// Per-agent prompt mode override ("compact", "minimal", or "" for default full)
+	promptMode PromptMode
+
 	// Self-evolve: predefined agents can update SOUL.md through chat
 	selfEvolve bool
 
@@ -288,6 +291,9 @@ type LoopConfig struct {
 	// Requested reasoning config parsed from agent other_config.
 	ReasoningConfig store.AgentReasoningConfig
 
+	// Per-agent prompt mode override (from other_config.prompt_mode)
+	PromptMode PromptMode
+
 	// Self-evolve: predefined agents can update SOUL.md (style/tone) through chat
 	SelfEvolve bool
 
@@ -404,6 +410,7 @@ func NewLoop(cfg LoopConfig) *Loop {
 		builtinToolSettings:    cfg.BuiltinToolSettings,
 		disabledTools:          cfg.DisabledTools,
 		reasoningConfig:        cfg.ReasoningConfig,
+		promptMode:             cfg.PromptMode,
 		selfEvolve:             cfg.SelfEvolve,
 		skillEvolve:            cfg.SkillEvolve,
 		skillNudgeInterval:     cfg.SkillNudgeInterval,

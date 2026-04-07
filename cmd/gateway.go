@@ -573,6 +573,9 @@ func runGateway() {
 	// Register config-based channels as fallback when no DB instances loaded.
 	registerConfigChannels(cfg, channelMgr, msgBus, pgStores, instanceLoader)
 
+	// Voice channel is always registered from config (not DB-backed).
+	registerVoiceChannel(cfg, channelMgr, msgBus)
+
 	// Register channels/instances/links/teams RPC methods
 	wireChannelRPCMethods(server, pgStores, channelMgr, agentRouter, msgBus, workspace)
 

@@ -372,6 +372,7 @@ type AgentSpec struct {
 	Default           bool            `json:"default,omitempty"`
 	Sandbox           *SandboxConfig  `json:"sandbox,omitempty"`
 	Identity          *IdentityConfig `json:"identity,omitempty"`
+	PromptMode        string          `json:"prompt_mode,omitempty"`    // "full" (default), "compact", "minimal"
 }
 
 // ReplaceFrom copies all data fields from src into c, preserving c's mutex.
